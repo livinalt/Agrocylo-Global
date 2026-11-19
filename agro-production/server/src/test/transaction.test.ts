@@ -103,6 +103,9 @@ function makeTx(overrides: Record<string, unknown> = {}) {
 describe('Transaction Status & Reconciliation API', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    (
+      prisma.transaction.findFirst as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(null);
     mockVerifySession.mockResolvedValue({
       walletAddress: WALLET,
       sessionToken: 'test-session',
@@ -151,9 +154,12 @@ describe('Transaction Status & Reconciliation API', () => {
     });
 
     it('returns existing transaction on duplicate requestId (idempotent)', async () => {
-      (
-        prisma.transaction.findFirst as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(makeTx({ status: 'confirmed', ledger: 500 }));
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(makeTx({ status: 'confirmed', ledger: 500 }))
+        .mockResolvedValueOnce(null);
 
       const res = await request(app)
         .post('/api/v1/transactions')
@@ -171,14 +177,17 @@ describe('Transaction Status & Reconciliation API', () => {
     });
 
     it('returns existing transaction on duplicate txHash', async () => {
-      (
-        prisma.transaction.findFirst as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(
-        makeTx({
-          id: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb',
-          status: 'submitted',
-        }),
-      );
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(
+          makeTx({
+            id: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb',
+            status: 'submitted',
+          }),
+        )
+        .mockResolvedValueOnce(null);
 
       const res = await request(app)
         .post('/api/v1/transactions')
@@ -191,6 +200,113 @@ describe('Transaction Status & Reconciliation API', () => {
 
       expect(res.status).toBe(200);
       expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
+    it('returns a non-disclosing conflict for a foreign requestId collision', async () => {
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: REQUEST_ID });
+
+      const res = await request(app)
+        .post('/api/v1/transactions')
+        .set('Authorization', 'Bearer test-session')
+        .send({
+          requestId: REQUEST_ID,
+          txHash: 'new-hash',
+          walletAddress: WALLET,
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.title).toBe('Transaction Conflict');
+      expect(res.body).not.toHaveProperty('walletAddress');
+      expect(res.body).not.toHaveProperty('requestId');
+      expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
+    it('returns a non-disclosing conflict for a foreign txHash collision', async () => {
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: 'foreign-transaction' });
+
+      const res = await request(app)
+        .post('/api/v1/transactions')
+        .set('Authorization', 'Bearer test-session')
+        .send({
+          requestId: 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb',
+          txHash: TX_HASH,
+          walletAddress: WALLET,
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.title).toBe('Transaction Conflict');
+      expect(res.body).not.toHaveProperty('walletAddress');
+      expect(res.body).not.toHaveProperty('requestId');
+      expect(prisma.transaction.create).not.toHaveBeenCalled();
+    });
+
+    it('returns the same-wallet transaction after a concurrent create race', async () => {
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(makeTx({ status: 'confirmed', ledger: 500 }))
+        .mockResolvedValueOnce(null);
+      (
+        prisma.transaction.create as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(
+        Object.assign(new Error('Unique constraint'), { code: 'P2002' }),
+      );
+
+      const res = await request(app)
+        .post('/api/v1/transactions')
+        .set('Authorization', 'Bearer test-session')
+        .send({
+          requestId: REQUEST_ID,
+          txHash: TX_HASH,
+          walletAddress: WALLET,
+        });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('confirmed');
+      expect(res.body.ledger).toBe(500);
+    });
+
+    it('returns a non-disclosing conflict when another wallet wins a create race', async () => {
+      const findFirst = prisma.transaction.findFirst as ReturnType<
+        typeof vi.fn
+      >;
+      findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({ id: REQUEST_ID });
+      (
+        prisma.transaction.create as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(
+        Object.assign(new Error('Unique constraint'), { code: 'P2002' }),
+      );
+
+      const res = await request(app)
+        .post('/api/v1/transactions')
+        .set('Authorization', 'Bearer test-session')
+        .send({
+          requestId: REQUEST_ID,
+          txHash: 'new-hash',
+          walletAddress: WALLET,
+        });
+
+      expect(res.status).toBe(409);
+      expect(res.body.title).toBe('Transaction Conflict');
+      expect(res.body).not.toHaveProperty('walletAddress');
+      expect(res.body).not.toHaveProperty('requestId');
     });
 
     it('rejects wallet address mismatch', async () => {

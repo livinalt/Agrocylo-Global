@@ -64,6 +64,50 @@ function txToResponse(
   };
 }
 
+async function findDuplicateTransaction(
+  requestId: string,
+  txHash: string,
+  walletAddress: string,
+) {
+  const identifierFilter = {
+    OR: [{ id: requestId }, { txHash }],
+  };
+  const [existing, conflicting] = await Promise.all([
+    prisma.transaction.findFirst({
+      where: { walletAddress, ...identifierFilter },
+    }),
+    prisma.transaction.findFirst({
+      where: {
+        AND: [
+          identifierFilter,
+          {
+            OR: [
+              { walletAddress: null },
+              { walletAddress: { not: walletAddress } },
+            ],
+          },
+        ],
+      },
+      select: { id: true },
+    }),
+  ]);
+
+  return { existing, hasConflict: conflicting !== null };
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'P2002'
+  );
+}
+
+function respondWithTransactionConflict(res: Response, req: WalletRequest) {
+  problemDetail(res, req, 409, 'Transaction Conflict');
+}
+
 router.post(
   '/transactions',
   requireWallet,
@@ -78,33 +122,63 @@ router.post(
       return;
     }
 
-    const existing = await prisma.transaction.findFirst({
-      where: { OR: [{ id: requestId }, { txHash }] },
-    });
+    const duplicate = await findDuplicateTransaction(
+      requestId,
+      txHash,
+      req.walletAddress,
+    );
 
-    if (existing) {
+    if (duplicate.hasConflict) {
+      respondWithTransactionConflict(res, req);
+      return;
+    }
+
+    if (duplicate.existing) {
       jsonValidated(
         res,
         TransactionStatusResponseSchema,
         200,
-        txToResponse(existing, walletAddress),
+        txToResponse(duplicate.existing, walletAddress),
       );
       return;
     }
 
-    const tx = await prisma.transaction.create({
-      data: {
-        id: requestId,
-        campaignId: campaignId ?? null,
-        walletAddress,
-        eventType: eventType ?? 'transaction.submitted',
-        status: 'awaiting_signature',
-        payload: {},
-        ledger: 0,
-        eventIndex: 0,
+    let tx;
+    try {
+      tx = await prisma.transaction.create({
+        data: {
+          id: requestId,
+          campaignId: campaignId ?? null,
+          walletAddress,
+          eventType: eventType ?? 'transaction.submitted',
+          status: 'awaiting_signature',
+          payload: {},
+          ledger: 0,
+          eventIndex: 0,
+          txHash,
+        },
+      });
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error;
+
+      const racedDuplicate = await findDuplicateTransaction(
+        requestId,
         txHash,
-      },
-    });
+        req.walletAddress,
+      );
+      if (racedDuplicate.existing && !racedDuplicate.hasConflict) {
+        jsonValidated(
+          res,
+          TransactionStatusResponseSchema,
+          200,
+          txToResponse(racedDuplicate.existing, walletAddress),
+        );
+        return;
+      }
+
+      respondWithTransactionConflict(res, req);
+      return;
+    }
 
     const response = txToResponse(tx, walletAddress);
     // Issue #1065: status updates are addressed to the owning wallet only and
